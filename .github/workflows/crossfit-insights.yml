@@ -1,0 +1,265 @@
+name: Garmin CrossFit Insights
+
+on:
+  workflow_run:
+    workflows: ["Garmin Advanced Analytics"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+  issues: write
+
+concurrency:
+  group: garmin-crossfit-insights
+  cancel-in-progress: false
+
+jobs:
+  crossfit:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Validar sintaxis V2.4.6
+        run: python -m py_compile garmin_recovery/crossfit.py test_sleep_integration.py garmin_recovery/pipeline_regression_tests.py
+
+      - name: Pruebas integración sueño V2.4.6
+        run: python -m unittest -v test_sleep_integration
+
+      - name: V2.9 - Descargar cadena exacta del run Advanced
+        if: github.event_name == 'workflow_run'
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: garmin-lineage-v29
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: .lineage_parent
+
+      - name: Generate CrossFit analysis
+        env:
+          RPE_CSV_URL: ${{ secrets.RPE_CSV_URL }}
+        run: python -m garmin_recovery.crossfit
+
+      - name: Historial de ejercicios (progresión)
+        continue-on-error: true
+        run: python -m garmin_recovery.progression
+
+      - name: V2.9 - Capturar filiacion por IDs reales
+        continue-on-error: true
+        run: |
+          mkdir -p .lineage_current
+          python -m garmin_recovery.pipeline_lineage --stage crossfit --out .lineage_current/pipeline_lineage_v29.json
+          cp .lineage_current/pipeline_lineage_v29.json pipeline_lineage_v29.json
+          # V8.16: anota el Sync raíz si Apps Script lo lanzó con firma verificada (va en el commit de esta etapa)
+          python -m garmin_recovery.sync_origin_ledger --from-lineage pipeline_lineage_v29.json || true
+
+      - name: V3.0 - Auditar contratos JSON sin alterar las fuentes
+        continue-on-error: true
+        run: |
+          mkdir -p .diagnostics_current
+          python -m garmin_recovery.json_contracts --out .diagnostics_current/schema_health_v30.json
+          cp .diagnostics_current/schema_health_v30.json schema_health_v30.json
+
+      # V3.3: no permitir 'verde' si falla el informe de tendencias/rendimiento.
+      # La salida candidata se valida antes de reemplazar el JSON publicado.
+      - name: V3.3 - Generar y validar informe de rendimiento OBLIGATORIO
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .diagnostics_current
+          rm -f .diagnostics_current/training_trends_v31.json
+          python -m garmin_recovery.training_trends --out .diagnostics_current/training_trends_v31.json
+          python -m garmin_recovery.validate_performance \
+            --candidate .diagnostics_current/training_trends_v31.json \
+            --crossfit crossfit_insights.json
+          # V3.5: validar el complemento antes de publicar el candidato.
+          python -m garmin_recovery.performance_enhancements \
+            --candidate .diagnostics_current/training_trends_v31.json \
+            --crossfit crossfit_insights.json
+          cp .diagnostics_current/training_trends_v31.json training_trends_v31.json
+
+      - name: Certify and record data-ready cycle V2.4.6
+        if: github.event_name == 'workflow_run'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CROSSFIT_RUN_ID: ${{ github.run_id }}
+          ADVANCED_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: python -m garmin_recovery.sleep_integration
+
+      # V5.3: la app corre al final, con el certificado del ciclo y los datos de fuerza ya generados.
+      - name: V5.3 - App de seguimiento e informe del ciclo (no bloqueante)
+        id: app_v5
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          PLANNED_CSV_URL: ${{ secrets.PLANNED_CSV_URL }}
+        run: python -m garmin_recovery run
+
+      # V5.6/V5.7: nunca publicar un informe roto. Sin "set -e": la restauración se ejecuta
+      # aunque falle la app, el validador o la copia de su resultado.
+      - name: V5.6 - Validar salidas de la app antes de publicar
+        id: validate_v56
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: bash {0}
+        env:
+          APP_OUTCOME: ${{ steps.app_v5.outcome }}
+        run: |
+          valid=false
+          rm -f app/validation.json
+          if [ "$APP_OUTCOME" = "success" ] && timeout 90 python -m garmin_recovery validate --max-age-min 60; then
+            valid=true
+            echo "Salidas de la app validadas."
+          fi
+          if [ "$valid" != "true" ]; then
+            tmp="${RUNNER_TEMP:-/tmp}/validation.json"
+            if [ -s app/validation.json ] && [ "$APP_OUTCOME" = "success" ]; then cp app/validation.json "$tmp"; else
+              reason="app_outcome:$APP_OUTCOME"; [ "$APP_OUTCOME" = "success" ] && reason="validator_error_or_timeout"
+              printf '{"status":"failed","errors":["%s"],"checks":0}\n' "$reason" > "$tmp"; fi
+            git checkout -- app history 2>/dev/null
+            git clean -fdq app history 2>/dev/null
+            mkdir -p app && cp "$tmp" app/validation.json
+            echo "::warning::Salidas no válidas (app: $APP_OUTCOME): se conserva el informe anterior."
+          fi
+          echo "valid=$valid" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Pruebas de regresión V2.4
+        run: python -m garmin_recovery.pipeline_regression_tests --stage crossfit
+
+      # V8.9: copias pequeñas del registro (últimas 72 h completas + índice) para lectores que no abren archivos de > 1 MB.
+      - name: V8.9 - Copias ligeras del registro de ciclos
+        continue-on-error: true
+        run: python -m garmin_recovery.ledger_light
+
+      # V8.4: ¿hay algo nuevo que publicar? Las cadenas repetidas tras el sueño sin cambios no lanzan monitor, web ni rutina.
+      - name: V8.4 - Control de publicación (solo si hay cambios)
+        id: gate
+        continue-on-error: true
+        run: python -m garmin_recovery.publish_gate
+
+      - name: Commit CrossFit insights and ready certificate
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crossfit_insights.json report_history.json
+          [ ! -f exercise_history.json ] || git add exercise_history.json
+          for f in app/readiness_v3.json app/dashboard.html app/informe.md app/informe_semanal.md app/informe_completo.md app/validation.json history/daily.csv history/sessions.csv history/reports.csv history/model_predictions.csv; do
+            [ ! -f "$f" ] || git add "$f"
+          done
+          [ ! -d app/charts ] || git add app/charts
+          [ ! -f report_cycles.json ] || git add report_cycles.json
+          for f in report_cycles_recent.json report_cycles_index.json; do [ ! -f "$f" ] || git add "$f"; done
+          [ ! -f report_ready.json ] || git add report_ready.json
+          # V3.3: informe requerido tras validacion, no es opcional.
+          git add training_trends_v31.json
+          [ ! -f schema_health_v30.json ] || git add schema_health_v30.json
+          [ ! -f pipeline_lineage_v29.json ] || git add pipeline_lineage_v29.json
+          [ ! -f sync_origin_ledger.json ] || git add sync_origin_ledger.json
+          [ ! -f publish_gate.json ] || git add publish_gate.json
+          if ! git diff --cached --quiet; then
+            git commit -m 'Update CrossFit insights and report readiness V2.4.6'
+            for attempt in 1 2 3 4 5; do
+              if ! git pull --rebase origin "${{ github.event.repository.default_branch }}"; then
+                git rebase --abort || true
+                exit 1
+              fi
+              if git push origin HEAD:"${{ github.event.repository.default_branch }}"; then
+                break
+              fi
+              if [ "$attempt" -eq 5 ]; then
+                echo 'Failed to publish CrossFit insights and gate after retries.' >&2
+                exit 1
+              fi
+              sleep $((attempt * 3))
+            done
+          fi
+
+      - name: V2.9 - Conservar evidencia de esta ejecucion (14 dias)
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: garmin-lineage-v29
+          path: .lineage_current/pipeline_lineage_v29.json
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: V6.0 - Aviso en GitHub si el informe no se publicó o se perdió una franja
+        if: always() && github.event_name == 'workflow_run'
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHAIN_STATUS: ${{ job.status }}
+        run: python -m garmin_recovery alert --scope chain
+
+      - name: V6.3 - Aviso al móvil (ntfy) del informe nuevo
+        if: always() && github.event_name == 'workflow_run'
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          CHAIN_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python -m garmin_recovery notify
+
+      - name: Disparar monitor final V2.4.1
+        if: success() && steps.gate.outputs.publish != 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          run_id = os.environ["GITHUB_RUN_ID"]
+
+          payload = {
+              "event_type": "garmin-monitor",
+              "client_payload": {
+                  "crossfit_run_id": run_id,
+                  "source": "crossfit_completed_pipeline"
+              }
+          }
+
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/dispatches",
+              data=json.dumps(payload).encode("utf-8"),
+              method="POST",
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "User-Agent": "Garmin-Recovery-Monitor-Dispatch/2.4.1",
+              },
+          )
+          with urllib.request.urlopen(req, timeout=20) as response:
+              if response.status != 204:
+                  raise RuntimeError(f"repository_dispatch returned HTTP {response.status}")
+
+          print("Monitor dispatch sent for CrossFit run", run_id)
+          PY
+
+      - name: V5.1 - Avisar a la rutina de Claude para el informe del ciclo
+        if: success() && github.event_name == 'workflow_run' && steps.validate_v56.outputs.valid == 'true' && steps.gate.outputs.publish != 'false'
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          CLAUDE_ROUTINE_URL: ${{ secrets.CLAUDE_ROUTINE_URL }}
+          CLAUDE_ROUTINE_TOKEN: ${{ secrets.CLAUDE_ROUTINE_TOKEN }}
+        run: python -m garmin_recovery.notify_claude_routine

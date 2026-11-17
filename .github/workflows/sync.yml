@@ -1,0 +1,109 @@
+name: Garmin Recovery Sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      origin_source:
+        description: 'Opcional: origen firmado del respaldo Apps Script'
+        required: false
+        type: string
+      cycle_id:
+        description: 'Opcional: ciclo firmado YYYY-MM-DD-HHMM'
+        required: false
+        type: string
+      requested_at:
+        description: 'Opcional: hora UTC del respaldo firmado'
+        required: false
+        type: string
+      request_id:
+        description: 'Opcional: identificador del respaldo firmado'
+        required: false
+        type: string
+      origin_proof:
+        description: 'Opcional: prueba HMAC del respaldo'
+        required: false
+        type: string
+  # Backup independently triggered by Apps Script, once its Code.gs is configured.
+  repository_dispatch:
+    types: [garmin-sync]
+
+  # Disparador principal: Apps Script firmado (apps_script/RespaldoGarmin231.gs), a la hora de cada franja.
+  # El cron de GitHub llega 2–5 h tarde: queda UNO solo como último recurso diario por si Apps Script cae.
+  schedule:
+    - cron: "30 8 * * *"
+      timezone: "Europe/Madrid"
+
+permissions:
+  contents: write
+  actions: write  # V8.6: para que el Sync de respaldo pueda cancelarse a sí mismo si ya no hace falta
+
+concurrency:
+  group: garmin-pipeline-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # Plantilla: no corre solo hasta que actives la variable GARMIN_RECOVERY_ACTIVO=true (ver INSTALACION.md).
+    if: github.event_name == 'workflow_dispatch' || vars.GARMIN_RECOVERY_ACTIVO == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # V8.6: el cron de GitHub llega horas tarde; si el ciclo de las 08:30 ya está certificado, se cancela este
+      # Sync para que la cadena no arranque (Heart solo sigue a un Sync terminado con éxito). Solo en «schedule».
+      - name: V8.6 - ¿Hace falta el Sync de respaldo?
+        id: guard
+        if: github.event_name == 'schedule'
+        run: python -m garmin_recovery.sync_guard
+
+      - name: V8.6 - Cancelar el Sync de respaldo innecesario
+        if: github.event_name == 'schedule' && steps.guard.outputs.skip == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run cancel "${{ github.run_id }}" --repo "${{ github.repository }}"
+          sleep 60
+
+      - name: V2.9.1 - Verificar origen antes de sincronizar
+        env:
+          GARMIN_ORIGIN_KEY_V291: ${{ secrets.GARMIN_ORIGIN_KEY_V291 }}
+        run: python -m garmin_recovery.dispatch_auth --out .garmin_origin_v291.json
+
+      - name: Obtener wellness de Intervals.icu
+        env:
+          INTERVALS_API_KEY: ${{ secrets.INTERVALS_API_KEY }}
+        run: python -m garmin_recovery.sync_fetch_wellness
+
+      - name: Obtener actividades de Intervals.icu
+        env:
+          INTERVALS_API_KEY: ${{ secrets.INTERVALS_API_KEY }}
+        run: python -m garmin_recovery.sync_fetch_activities
+
+      - name: Crear análisis profesional diario y semanal
+        run: python -m garmin_recovery.sync_daily_analysis
+
+      - name: Guardar datos de Intervals con reintentos
+        shell: bash
+        run: bash sync_publish.sh
+
+      - name: V2.9 - Registrar origen verificable del run Sync
+        continue-on-error: true
+        run: |
+          mkdir -p .lineage_current
+          python -m garmin_recovery.pipeline_lineage --stage sync --out .lineage_current/pipeline_lineage_v29.json
+          python -m garmin_recovery.dispatch_auth --attach-lineage .lineage_current/pipeline_lineage_v29.json --origin-file .garmin_origin_v291.json
+
+      - name: V2.9 - Conservar filiacion del run Sync por 14 dias
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: garmin-lineage-v29
+          path: .lineage_current/pipeline_lineage_v29.json
+          retention-days: 14
+          if-no-files-found: error

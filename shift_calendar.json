@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "timezone": "Europe/Madrid",
+  "confirmed_months": [],
+  "shift_hours": {
+    "MT": {
+      "start": "08:00",
+      "end": "22:00",
+      "end_day_offset": 0
+    },
+    "TN": {
+      "start": "15:00",
+      "end": "08:00",
+      "end_day_offset": 1
+    },
+    "M": {
+      "start": "08:00",
+      "end": "15:00",
+      "end_day_offset": 0
+    }
+  },
+  "days": {},
+  "notes": "Rellena tus turnos (códigos de shift_hours) por fecha y añade el mes a confirmed_months cuando esté completo; los días no indicados de un mes confirmado cuentan como libres. Si no trabajas a turnos, déjalo vacío. La fecha TN corresponde al inicio del turno."
+}

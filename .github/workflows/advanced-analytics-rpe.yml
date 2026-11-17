@@ -1,0 +1,126 @@
+name: Garmin Advanced Analytics
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Garmin Heart Rate Enrichment"]
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: garmin-pipeline-main
+  cancel-in-progress: false
+
+jobs:
+  advanced-analytics:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - name: Configurar Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: V2.9 - Descargar filiacion del run Garmin FC
+        if: github.event_name == 'workflow_run'
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: garmin-lineage-v29
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: .lineage_parent
+
+      - name: Validar sintaxis
+        run: |
+          python -m py_compile garmin_recovery/advanced.py garmin_recovery/rpe_enrichment.py garmin_recovery/validate_pipeline.py garmin_recovery/reliability.py garmin_recovery/pipeline_regression_tests.py garmin_recovery/morning_sleep_gate.py
+
+      - name: Calcular analítica avanzada + RPE
+        env:
+          INTERVALS_API_KEY: ${{ secrets.INTERVALS_API_KEY }}
+          DAY_CONTEXT_B64: ${{ secrets.DAY_CONTEXT_B64 }}
+          RPE_CSV_URL: ${{ secrets.RPE_CSV_URL }}
+        run: |
+          python -m garmin_recovery.rpe_enrichment
+
+      - name: Fusionar recuperación, sueño y VFC con guardrails
+        run: |
+          python -m garmin_recovery.reliability
+
+      - name: Clasificar sueño matinal sin alterar el modelo de recuperación
+        run: |
+          python -m garmin_recovery.morning_sleep_gate
+
+      - name: Validar integridad del pipeline
+        run: |
+          python -m garmin_recovery.validate_pipeline
+
+      - name: Pruebas de regresión V2.4
+        run: |
+          python -m garmin_recovery.pipeline_regression_tests --stage advanced
+
+      - name: V2.9 - Capturar origen y padre por ID real
+        continue-on-error: true
+        run: |
+          mkdir -p .lineage_current
+          python -m garmin_recovery.pipeline_lineage --stage advanced --out .lineage_current/pipeline_lineage_v29.json
+
+      - name: Guardar analítica avanzada con reintentos
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Garmin Recovery Bot"
+          git config user.email "actions@github.com"
+
+          git add advanced_analytics.json data_quality.json activity_hr_recovery.json
+          [ -f activity_hr_curves.json ] && git add activity_hr_curves.json || true
+          git add daily_summary.json weekly_summary.json recovery_assessment.json morning_sleep_status.json
+          [ -f training_feedback.json ] && git add training_feedback.json || true
+          [ -f day_context.json ] && git add day_context.json || true
+
+          if git diff --cached --quiet; then
+            echo "Sin cambios de analítica que publicar."
+            exit 0
+          fi
+
+          git commit -m "Actualizar analítica, RPE y estado de sueño matinal"
+
+          for attempt in 1 2 3 4 5; do
+            echo "Intento de publicación $attempt/5"
+
+            if ! git pull --rebase origin main; then
+              echo "Conflicto al integrar cambios remotos. No se sobrescriben datos." >&2
+              git rebase --abort || true
+              exit 1
+            fi
+
+            if git push origin HEAD:main; then
+              echo "Analítica avanzada publicada correctamente."
+              exit 0
+            fi
+
+            sleep $((attempt * 3))
+          done
+
+          echo "No se pudo publicar después de cinco intentos." >&2
+          exit 1
+
+      - name: V2.9 - Conservar filiacion por 14 dias
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: garmin-lineage-v29
+          path: .lineage_current/pipeline_lineage_v29.json
+          retention-days: 14
+          if-no-files-found: error

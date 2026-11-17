@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "note": "RPE y nombre de carreras que solo están en Garmin (no en Intervals.icu). Claves = ID de actividad de Garmin. La hoja manda si la carrera llega a Intervals.",
+  "runs": {}
+}

@@ -1,0 +1,281 @@
+name: Garmin Recovery CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app_config.json'
+      - 'requirements*.txt'
+      - 'pyproject.toml'
+      - '**.py'
+      - '**.sh'
+      - '.github/workflows/*.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'app_config.json'
+      - 'requirements*.txt'
+      - 'pyproject.toml'
+      - '**.py'
+      - '**.sh'
+      - '.github/workflows/*.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: garmin-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Syntax-check all Python source files
+        run: python -m compileall -q .
+
+      - name: Install pinned YAML parser for workflow validation
+        run: python -m pip install --disable-pip-version-check 'PyYAML==6.0.3'
+
+      - name: Revisión de estilo (ruff) de todo el repositorio
+        run: |
+          python -m pip install --disable-pip-version-check 'ruff==0.16.8'
+          ruff check .
+
+      - name: Sintaxis del JavaScript de la web
+        run: node --check garmin_recovery/web/dashboard.js
+
+      - name: Validate workflow YAML, triggers and pipeline topology
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          class StrictLoader(yaml.BaseLoader):
+              def construct_mapping(self, node, deep=False):
+                  seen = set()
+                  for key_node, _ in node.value:
+                      key = self.construct_object(key_node, deep=deep)
+                      if key in seen:
+                          raise ValueError(f"Duplicate YAML key: {key!r}")
+                      seen.add(key)
+                  return super().construct_mapping(node, deep=deep)
+
+          folder = Path('.github/workflows')
+          workflows = {}
+          for file in sorted(folder.glob('*.yml')):
+              doc = yaml.load(file.read_text(encoding='utf-8'), Loader=StrictLoader)
+              assert isinstance(doc, dict), f'{file}: invalid YAML document'
+              assert isinstance(doc.get('on'), dict), f'{file}: missing event configuration'
+              assert isinstance(doc.get('jobs'), dict) and doc['jobs'], f'{file}: missing jobs'
+              assert doc.get('permissions'), f'{file}: missing explicit token permissions'
+              workflows[file.name] = doc
+
+          required = {
+              'sync.yml', 'garmin-heart-rate.yml',
+              'advanced-analytics-rpe.yml', 'crossfit-insights.yml',
+              'monitor-monthly.yml', 'garmin-ci.yml',
+          }
+          assert required <= workflows.keys(), f'Missing workflows: {required - workflows.keys()}'
+          for child, parent in (
+              ('garmin-heart-rate.yml', 'Garmin Recovery Sync'),
+              ('advanced-analytics-rpe.yml', 'Garmin Heart Rate Enrichment'),
+              ('crossfit-insights.yml', 'Garmin Advanced Analytics'),
+          ):
+              parents = workflows[child]['on']['workflow_run']['workflows']
+              assert parent in parents, f'{child}: missing workflow_run parent {parent}'
+
+          sync = workflows['sync.yml']['on']
+          assert 'workflow_dispatch' in sync
+          assert 'garmin-sync' in sync['repository_dispatch']['types']
+          schedules = sync['schedule']
+          # V5.9: Apps Script dispara las tres franjas; el cron es un único respaldo diario.
+          assert [entry['cron'] for entry in schedules] == ['30 8 * * *'], 'Sync fallback cron unexpectedly changed'
+          assert all(entry.get('timezone') == 'Europe/Madrid' for entry in schedules)
+          monitor = workflows['monitor-monthly.yml']['on']
+          assert 'garmin-monitor' in monitor['repository_dispatch']['types']
+          ci = workflows['garmin-ci.yml']['on']
+          assert 'push' in ci and 'pull_request' in ci and 'workflow_dispatch' in ci
+          assert 'schedule' not in ci, 'CI must not consume scheduled pipeline cycles'
+
+          # V2.9.6: el espejo se dispara fuera de la cadena workflow_run.
+          shadow = workflows['garmin-shadow-publish-v296.yml']['on']
+          assert 'workflow_dispatch' in shadow, 'Manual shadow fallback removed'
+          assert shadow['repository_dispatch']['types'] == ['garmin-shadow-publish']
+          assert 'workflow_run' not in shadow and 'schedule' not in shadow
+          steps = workflows['monitor-monthly.yml']['jobs']['monitor']['steps']
+          dispatcher = [x for x in steps if 'garmin_recovery.shadow_autodispatch' in x.get('run', '')]
+          assert len(dispatcher) == 1 and dispatcher[0].get('if') == 'success()'
+
+          # V2.9.7: nueva telemetria opcional, nunca bloquea el espejo.
+          clarity = [x for x in steps if 'garmin_recovery.monitor_clarity' in x.get('run', '')]
+          assert len(clarity) == 1 and clarity[0].get('continue-on-error') == 'true'
+          assert steps.index(clarity[0]) < steps.index(dispatcher[0])
+          crossfit_steps = workflows['crossfit-insights.yml']['jobs']['crossfit']['steps']
+          # V3.9.0: monitor-linked certified reports, no duplicate workflow_run.
+          report_jobs = workflows['monitor-monthly.yml']['jobs']
+          assert 'certified-reports-after-monitor' in report_jobs
+          certified = report_jobs['certified-reports-after-monitor']
+          assert certified.get('needs') == 'monitor'
+          assert certified.get('if') == ("$" + "{{ needs.monitor.result == 'success' }}")
+          assert certified.get('permissions', {}).get('contents') == 'read'
+          report_steps = certified.get('steps', [])
+          assert any('garmin_recovery.cycle_report_batch' in x.get('run', '') for x in report_steps)
+          assert any(x.get('uses', '').startswith('actions/upload-artifact@') for x in report_steps)
+          manual = workflows['garmin-certified-reports.yml']['on']
+          assert 'workflow_dispatch' in manual
+          assert 'workflow_run' not in manual and 'schedule' not in manual
+          # V5.9: los informes previos (V3.9.2.2 enriquecido y V4.0.2 visual) se retiraron del monitor;
+          # el informe vigente es app/informe.md (V5). Sus módulos siguen probados en CI hasta su retirada.
+          assert 'v40-preview-after-monitor' not in report_jobs and 'enriched-reports-after-monitor' not in report_jobs
+          assert 'workflow_run' not in workflows['monitor-monthly.yml']['on']
+          # V5.0: la app corre en modo sombra y nunca bloquea la cadena.
+          adv_steps = workflows['advanced-analytics-rpe.yml']['jobs']['advanced-analytics']['steps']
+          assert not any('garmin_recovery run' in x.get('run', '') for x in adv_steps), 'App V5.3 runs in CrossFit'
+          cf_steps = workflows['crossfit-insights.yml']['jobs']['crossfit']['steps']
+          app = [x for x in cf_steps if 'python -m garmin_recovery run' in x.get('run', '')]
+          assert len(app) == 1 and app[0].get('continue-on-error') == 'true', 'App V5 must be non-blocking'
+          names = [x.get('name', '') for x in cf_steps]
+          cert_i = next(i for i, n in enumerate(names) if n.startswith('Certify and record'))
+          commit_i = next(i for i, n in enumerate(names) if n.startswith('Commit CrossFit'))
+          assert cert_i < cf_steps.index(app[0]) < commit_i, 'App must run after certificate and before commit'
+          for wf_name, job in (('sync.yml', 'sync'), ('garmin-heart-rate.yml', 'heart-rate'),
+                               ('advanced-analytics-rpe.yml', 'advanced-analytics'), ('crossfit-insights.yml', 'crossfit')):
+              assert workflows[wf_name]['jobs'][job].get('timeout-minutes'), f'{wf_name}: missing job timeout'
+          # V5.1: el aviso a la rutina de Claude es opcional y va al final de la cadena.
+          notify = [x for x in crossfit_steps if 'garmin_recovery.notify_claude_routine' in x.get('run', '')]
+          assert len(notify) == 1 and notify[0].get('continue-on-error') == 'true', 'Routine notify must be non-blocking'
+          assert crossfit_steps.index(notify[0]) == len(crossfit_steps) - 1, 'Routine notify must be the last step'
+          # V5.6: validación de salidas entre la app y el commit, no bloqueante.
+          val = [x for x in cf_steps if 'garmin_recovery validate' in x.get('run', '')]
+          assert len(val) == 1 and val[0].get('continue-on-error') == 'true', 'Output validation must be non-blocking'
+          assert cf_steps.index(app[0]) < cf_steps.index(val[0]) < commit_i, 'Validation must run after app and before commit'
+          print(f'OK: {len(workflows)} workflows parse correctly; triggers and chain validated.')
+          PY
+
+      - name: Validate Sync publication shell syntax
+        run: bash -n sync_publish.sh
+
+      - name: Full unit test suite with coverage (auto-discovered, includes app V5 tests)
+        run: |
+          python -m pip install --disable-pip-version-check 'coverage==7.6.10'
+          python -m coverage run -m unittest discover -v -s . -p 'test_*.py'
+          python -m coverage report --skip-empty | tee coverage.txt
+          echo "::notice title=Cobertura total::$(grep '^TOTAL' coverage.txt)"
+          # los 12 módulos con peor cobertura y más líneas sin cubrir, legibles desde la API de anotaciones
+          python - <<'PY'
+          import re
+          rows = []
+          for line in open("coverage.txt"):
+              m = re.match(r"(garmin_recovery/\S+)\s+(\d+)\s+(\d+)\s+(\d+)%", line)
+              if m:
+                  rows.append((int(m.group(3)), int(m.group(4)), m.group(1), int(m.group(2))))
+          rows.sort(reverse=True)
+          print("::notice title=Menos cubiertos (líneas sin cubrir)::" + " | ".join(f"{n} {miss}/{tot} ({pc}%)" for miss, pc, n, tot in rows[:12]))
+          PY
+          { echo '### Cobertura de tests'; echo '```'; cat coverage.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: V3.9.0 - Certified report regression suite
+        run: python -m unittest -v test_cycle_report_v386
+
+      - name: Audit certificate ledger hashes without modifying records
+        run: |
+          if [ -f report_cycles.json ]; then python -m garmin_recovery.archive_report_cycles; else echo "Aún no hay registro de ciclos (instalación nueva)."; fi
+
+      - name: Verify midnight and partial-day regression scenarios
+        run: |
+          python - <<'PY'
+          from garmin_recovery.pipeline_regression_tests import test_partial_day
+
+          def check(latest, generated, flag, expected_error=None, expected_warning=None,
+                    excluded=1):
+              hr = {'days': {latest: {'partial_day': True}}}
+              advanced = {'robust_trends': {
+                  w: {'metrics': {'daytime_hr': {'partial_days_excluded': excluded}}}
+                  for w in ('3d', '7d', '28d')
+              }}
+              quality = {'generated_at': generated,
+                         'today': {'heart_rate_partial_day': flag,
+                                   'day_hr_samples': 0, 'night_hr_samples': 0}}
+              errors, warnings = [], []
+              test_partial_day(hr, advanced, quality, errors, warnings)
+              if expected_error is None:
+                  assert not errors, (latest, generated, errors)
+              else:
+                  assert any(x.startswith(expected_error) for x in errors), errors
+              if expected_warning is None:
+                  assert not warnings, (latest, generated, warnings)
+              else:
+                  assert any(x.startswith(expected_warning) for x in warnings), warnings
+
+          check('2026-10-10', '2026-10-10T23:55:00+02:00', True)
+          check('2026-10-10', '2026-10-11T00:01:00+02:00', False,
+                expected_warning='partial_day_hr_source_behind_quality_date')
+          check('2026-10-11', '2026-10-11T00:09:00+02:00', True)
+          check('2026-10-10', '2026-10-10T23:55:00+02:00', False,
+                expected_error='partial_day_quality_flag_lost')
+          check('2026-10-10', '2026-10-09T23:00:00+02:00', False,
+                expected_error='partial_day_quality_outdated')
+          check('2026-10-10', 'invalid-date', False,
+                expected_error='partial_day_quality_date_missing')
+          check('2026-10-10', '2026-10-10T23:55:00+02:00', True,
+                expected_error='partial_day_not_excluded_from_daytime_trend', excluded=0)
+          print('OK: seven midnight/partial-day regression scenarios.')
+          PY
+
+      - name: Validate pending sleep at midnight and after night shifts
+        run: |
+          python - <<'PYCODE'
+          from datetime import datetime
+          from unittest.mock import patch
+          from zoneinfo import ZoneInfo
+          from garmin_recovery import advanced as aa
+          tz = ZoneInfo('Europe/Madrid')
+          saved_now, saved_today = aa.NOW, aa.TODAY
+
+          def evaluate(hour, post_tn, sleep=False, night_samples=0):
+              now = datetime(2026, 10, 11, hour, 30, tzinfo=tz)
+              aa.NOW, aa.TODAY = now, now.date()
+              try:
+                  row = {'hr_partial_day': True,
+                         'sleep_window_available': sleep,
+                         'night_hr_samples': night_samples,
+                         'day_hr_samples': 0}
+                  with patch('garmin_recovery.shift_calendar.resolve_day',
+                             return_value={'post_tn': post_tn}):
+                      return aa.data_quality(
+                          {now.date().isoformat(): row},
+                          [{'id': 'synthetic'}], {'days': {'2026-10-10': {}}}, {}, {})
+              finally:
+                  aa.NOW, aa.TODAY = saved_now, saved_today
+
+          midnight = evaluate(0, False)
+          assert midnight['today_availability_state'] == 'early_day_pending', midnight
+          assert 'sleep_window_pending_day_start' in midnight['pending_today']
+          assert 'missing_sleep_window' not in midnight['issues']
+          assert midnight['score'] <= 74
+
+          post_night_shift = evaluate(14, True)
+          assert post_night_shift['today_availability_state'] == 'post_tn_sleep_pending'
+          assert 'missing_sleep_window' not in post_night_shift['issues']
+          assert post_night_shift['score'] <= 74
+
+          observed = evaluate(14, True, sleep=True, night_samples=120)
+          assert observed['today_availability_state'] == 'evaluated'
+          assert not observed['pending_today']
+
+          regular_noon = evaluate(14, False)
+          assert 'missing_sleep_window' in regular_noon['issues']
+          late_post_shift = evaluate(19, True)
+          assert 'missing_sleep_window' in late_post_shift['issues']
+          print('OK: five permanent day-start / post-night-shift regression checks')
+          PYCODE
+
+      - name: Monitor schedule and fallback provenance tests
+        run: python -m garmin_recovery.monitor_v231

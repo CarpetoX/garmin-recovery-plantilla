@@ -1,0 +1,110 @@
+name: Garmin Heart Rate Enrichment
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Garmin Recovery Sync"]
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: garmin-pipeline-main
+  cancel-in-progress: false
+
+jobs:
+  heart-rate:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: true
+
+      - name: Configurar Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: V2.9 - Descargar filiacion del Sync que disparo Garmin FC
+        if: github.event_name == 'workflow_run'
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: garmin-lineage-v29
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: .lineage_parent
+
+      - name: Validar sintaxis Garmin
+        run: python -m py_compile garmin_recovery/garmin_metrics.py garmin_recovery/garmin_activity_metrics.py garmin_recovery/garmin_runs.py garmin_recovery/garmin_hr_timeline.py garmin_recovery/garmin_hrv_timeline.py garmin_recovery/garmin_sleep_history.py
+
+      - name: Instalar Garmin Connect
+        run: python -m pip install --disable-pip-version-check 'garminconnect==0.3.17'
+
+      - name: Actualizar FC, VFC y sueño de Garmin
+        env:
+          GARMIN_TOKENS_B64: ${{ secrets.GARMIN_TOKENS_B64 }}
+        run: |
+          python -m garmin_recovery.garmin_metrics
+          python -m garmin_recovery.garmin_activity_metrics
+          python -m garmin_recovery.garmin_runs  # V8.8: historial de carreras con todos sus datos (nunca falla la cadena)
+          python -m garmin_recovery.garmin_hr_timeline
+          python -m garmin_recovery.garmin_hrv_timeline
+          python -m garmin_recovery.garmin_sleep_history
+
+      - name: Guardar métricas Garmin con reintentos
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'Garmin Recovery Bot'
+          git config user.email 'actions@github.com'
+
+          for f in garmin_heart_rate.json garmin_hr_timeline.json garmin_hrv_timeline.json garmin_sleep_history.json daily_summary.json weekly_summary.json garmin_status.json garmin_stress.json garmin_body_battery.json garmin_extended.json running_history.json; do
+            if [ -f "$f" ]; then git add -- "$f"; fi
+          done
+
+          if git diff --cached --quiet; then
+            echo 'Sin cambios de métricas que publicar.'
+            exit 0
+          fi
+
+          git commit -m 'Actualizar Garmin FC, VFC y sueño'
+
+          for attempt in 1 2 3 4 5; do
+            echo "Intento de publicación $attempt/5"
+            if ! git pull --rebase origin main; then
+              echo 'Conflicto al integrar cambios remotos. Se detiene sin sobrescribir datos.'
+              git rebase --abort || true
+              exit 1
+            fi
+            if git push origin HEAD:main; then
+              echo 'Métricas publicadas correctamente.'
+              exit 0
+            fi
+            sleep $((attempt * 3))
+          done
+
+          echo 'No se pudo publicar después de cinco intentos.' >&2
+          exit 1
+
+      - name: V2.9 - Capturar filiacion del run Heart Rate
+        continue-on-error: true
+        run: |
+          mkdir -p .lineage_current
+          python -m garmin_recovery.pipeline_lineage --stage heart --out .lineage_current/pipeline_lineage_v29.json
+
+      - name: V2.9 - Conservar filiacion por 14 dias
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: garmin-lineage-v29
+          path: .lineage_current/pipeline_lineage_v29.json
+          retention-days: 14
+          if-no-files-found: error

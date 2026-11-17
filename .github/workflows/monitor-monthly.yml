@@ -1,0 +1,200 @@
+name: Garmin Workflow Monitor and Monthly Report
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [garmin-monitor]
+  schedule:
+    # Watchdogs ~155 min after each nominal Sync slot.
+    # They catch a broken chain even when CrossFit never reaches the dispatch step.
+    - cron: '5 11 * * *'
+      timezone: 'Europe/Madrid'
+    - cron: '20 19 * * *'
+      timezone: 'Europe/Madrid'
+    - cron: '20 1 * * *'
+      timezone: 'Europe/Madrid'
+
+permissions:
+  contents: write
+  actions: read
+  issues: write
+
+concurrency:
+  group: garmin-monitor-monthly
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    # Plantilla: no corre solo hasta que actives la variable GARMIN_RECOVERY_ACTIVO=true (ver INSTALACION.md).
+    if: github.event_name == 'workflow_dispatch' || vars.GARMIN_RECOVERY_ACTIVO == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Esperar cierre del CrossFit que disparó el monitor
+        if: github.event_name == 'repository_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRIGGER_RUN_ID: ${{ github.event.client_payload.crossfit_run_id }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.request
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          run_id = os.environ.get("TRIGGER_RUN_ID", "")
+
+          if not run_id.isdigit():
+              raise SystemExit("Missing valid CrossFit run id in repository_dispatch payload")
+
+          url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}"
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "Garmin-Recovery-Monitor-Wait/2.4.1",
+          }
+
+          for attempt in range(60):
+              req = urllib.request.Request(url, headers=headers)
+              with urllib.request.urlopen(req, timeout=20) as response:
+                  run = json.load(response)
+
+              status = run.get("status")
+              conclusion = run.get("conclusion")
+              print(f"CrossFit run {run_id}: status={status} conclusion={conclusion}")
+
+              if status == "completed":
+                  if conclusion != "success":
+                      raise SystemExit(
+                          f"Triggering CrossFit run completed with {conclusion}"
+                      )
+                  break
+
+              time.sleep(5)
+          else:
+              raise SystemExit("Timed out waiting for triggering CrossFit run to complete")
+          PY
+
+      - name: Inspect actual workflow runs and generate monthly summary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python -m garmin_recovery.monitor
+
+      - name: V2.9.2 - Vincular origen y puntualidad al monitor
+        continue-on-error: true
+        run: python -m garmin_recovery.origin_integration
+
+      # V3.4: distinguir ciclo, informe publicado y entrega real; sin recibos ficticios.
+      - name: V3.4 - Auditar trazabilidad y post-sueno sin duplicar certificados
+        run: python -m garmin_recovery.report_monitor
+
+      # V3.7.3: consulta independiente Actions, sin bloqueo ni recibos ficticios.
+      - name: V3.7.3 - Observar certificado de ciclo y enlace CrossFit
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python -m garmin_recovery.cycle_observer
+
+      # V2.9.7: capa aditiva, sin alterar el estado historico ni bloquear el espejo.
+      - name: V2.9.7 - Separar el ciclo actual de las alertas historicas
+        continue-on-error: true
+        run: python -m garmin_recovery.monitor_clarity
+
+      - name: V2.9.4 - Calcular fiabilidad historica de 7 y 28 dias
+        run: python -m garmin_recovery.reliability_history --ledger report_cycles.json --out reliability_history_v294.json
+
+      # V7.2: estado final del ciclo (cadena + web publicada + aviso aceptado por ntfy); nunca bloquea.
+      - name: V7.2 - Estado final del ciclo (web y notificación)
+        if: github.event_name == 'repository_dispatch'
+        continue-on-error: true
+        timeout-minutes: 8
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRIGGER_RUN_ID: ${{ github.event.client_payload.crossfit_run_id }}
+        run: python -m garmin_recovery.cycle_delivery
+
+      - name: V6.0 - Aviso en GitHub si no hay informe reciente (vigilancia programada)
+        if: always() && github.event_name == 'schedule'
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python -m garmin_recovery alert --scope watchdog
+
+      - name: Commit diagnostics and report
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add workflow_health.json monthly_report.json
+          [ ! -f origin_monitor_v292.json ] || git add origin_monitor_v292.json
+          [ ! -f reliability_history_v294.json ] || git add reliability_history_v294.json
+          [ ! -f cycle_observation_v373.json ] || git add cycle_observation_v373.json
+          [ ! -f delivery_status.json ] || git add delivery_status.json
+          if git diff --cached --quiet; then
+            echo 'No diagnostic changes to publish.'
+            exit 0
+          fi
+          git commit -m 'Update workflow health and monthly report'
+          for attempt in 1 2 3 4 5; do
+            if ! git pull --rebase origin "${{ github.event.repository.default_branch }}"; then
+              git rebase --abort || true
+              echo 'Conflict while rebasing monitor reports; refusing to overwrite remote data.' >&2
+              exit 1
+            fi
+            if git push origin HEAD:"${{ github.event.repository.default_branch }}"; then
+              exit 0
+            fi
+            sleep $((attempt * 3))
+          done
+          echo 'Failed to publish monitor reports after five attempts.' >&2
+          exit 1
+
+      # V2.9.6 AUTO: al terminar el monitor, comparar el historico validado
+      # con el espejo persistente. No crea tareas ni toca report_cycles.json.
+      - name: V2.9.6 - Solicitar espejo automatico si hay certificados nuevos
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python -m garmin_recovery.shadow_autodispatch --source report_cycles.json
+  certified-reports-after-monitor:
+    name: V3.8.8 - Certified reports after successful monitor
+    needs: monitor
+    if: ${{ needs.monitor.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout latest default branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Validate certified report regression
+        run: python -m unittest -v test_cycle_report_v386 test_cycle_real_integration_v382
+      - name: Generate certified reports (artifact only)
+        run: python -m garmin_recovery.cycle_report_batch --ledger report_cycles.json --outdir certified_cycle_reports_v386
+      - name: Upload reports and quarantine manifest
+        uses: actions/upload-artifact@v7
+        with:
+          name: garmin-certified-reports-v388-${{ github.run_id }}
+          path: certified_cycle_reports_v386/
+          if-no-files-found: error
+          retention-days: 30
