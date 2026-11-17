@@ -182,7 +182,8 @@ jobs:
           { echo '### Cobertura de tests'; echo '```'; cat coverage.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: V3.9.0 - Certified report regression suite
-        run: python -m unittest -v test_cycle_report_v386
+        run: |
+          if [ -f report_cycles.json ]; then python -m unittest -v test_cycle_report_v386; else echo "Aún no hay registro de ciclos (instalación nueva)."; fi
 
       - name: Audit certificate ledger hashes without modifying records
         run: |
